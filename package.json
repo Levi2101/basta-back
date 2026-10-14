@@ -1,0 +1,19 @@
+{
+  "name": "basta-back",
+  "version": "1.0.0",
+  "description": "Backend en tiempo real para el juego Basta!",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["basta", "socket.io", "express", "multiplayer"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "socket.io": "^4.8.4"
+  }
+}
