@@ -14,11 +14,10 @@ const io = new Server(server, {
     }
 });
 
-// Estado global de salas y temporizadores en memoria
 const salas = {};
 const desconexionesPendientes = {};
 const temporizadoresBasta = {};
-const temporizadoresRonda = {}; // Temporizadores para los 60s/90s principales
+const temporizadoresRonda = {};
 const ABECEDARIO = 'ABCDEFGHIKLMNOPQRSTUVXYZ'.split('');
 
 function generarCodigo() {
@@ -34,6 +33,38 @@ function limpiarTemporizadores(codigo) {
         clearInterval(temporizadoresBasta[codigo]);
         delete temporizadoresBasta[codigo];
     }
+}
+
+// Función limpia y directa: Lo que estaba en el snapshot es verde, lo nuevo o vacío es rojo
+function aplicarAnulacionPorTrampa(sala) {
+    if (!sala || !sala.jugadores) return;
+    if (!sala.palabrasInvalidas) sala.palabrasInvalidas = {};
+
+    sala.jugadores.forEach(j => {
+        if ((j.strikes || 0) > 0) {
+            const nombreClean = j.nombre.trim().toLowerCase();
+            const snapshotPre = j.respuestasValidasPreTrampa || {};
+
+            sala.categorias.forEach(cat => {
+                const respActual = (j.respuestas && j.respuestas[cat]) ? String(j.respuestas[cat]).trim() : '';
+                const respPrevia = (snapshotPre[cat]) ? String(snapshotPre[cat]).trim() : '';
+
+                const keyNombre = `${nombreClean}-${cat}`;
+                const keyId = `${j.id}-${cat}`;
+
+                // REGLA DEFINITIVA:
+                // Si la respuesta actual es exactamente igual a lo que había en el snapshot previo (y no está vacío), es VÁLIDA (Verde).
+                // Si estaba vacío en el snapshot, o cambió/se agregó algo nuevo después, es INVÁLIDA (Rojo).
+                if (respActual !== '' && respPrevia !== '' && respActual.toLowerCase() === respPrevia.toLowerCase()) {
+                    delete sala.palabrasInvalidas[keyNombre];
+                    delete sala.palabrasInvalidas[keyId];
+                } else {
+                    sala.palabrasInvalidas[keyNombre] = true;
+                    sala.palabrasInvalidas[keyId] = true;
+                }
+            });
+        }
+    });
 }
 
 io.on('connection', (socket) => {
@@ -80,7 +111,7 @@ io.on('connection', (socket) => {
         io.to(codigo.toUpperCase()).emit('actualizar_sala', sala);
     });
 
-    // 3. INICIAR RONDA (CON TEMPORIZADOR DE SERVIDOR)
+    // 3. INICIAR RONDA
     socket.on('iniciar_ronda', ({ codigo }) => {
         const sala = salas[codigo];
         if (!sala) return;
@@ -109,7 +140,6 @@ io.on('connection', (socket) => {
             sala
         });
 
-        // Iniciar el temporizador de 60s/90s en el servidor
         temporizadoresRonda[codigo] = setInterval(() => {
             tiempoRestante -= 1;
 
@@ -120,13 +150,14 @@ io.on('connection', (socket) => {
             if (tiempoRestante <= 0) {
                 limpiarTemporizadores(codigo);
 
+                aplicarAnulacionPorTrampa(sala);
+
                 sala.estado = 'revision';
                 sala.confirmadosRevision = [];
-                sala.palabrasInvalidas = {};
 
                 io.to(codigo).emit('ir_a_revision', { sala });
                 io.to(codigo).emit('revision_actualizada', {
-                    palabrasInvalidas: sala.palabrasInvalidas,
+                    palabrasInvalidas: { ...sala.palabrasInvalidas },
                     confirmadosRevision: sala.confirmadosRevision
                 });
             }
@@ -150,7 +181,6 @@ io.on('connection', (socket) => {
         const jugador = sala.jugadores.find(j => j.id === socket.id);
         if (jugador) jugador.respuestas = respuestas;
 
-        // Cancelar el temporizador principal de 60s
         if (temporizadoresRonda[codigo]) {
             clearInterval(temporizadoresRonda[codigo]);
             delete temporizadoresRonda[codigo];
@@ -174,34 +204,67 @@ io.on('connection', (socket) => {
             } else {
                 limpiarTemporizadores(codigo);
 
+                aplicarAnulacionPorTrampa(sala);
+
                 sala.estado = 'revision';
                 sala.confirmadosRevision = [];
-                sala.palabrasInvalidas = {};
 
                 io.to(sala.codigo).emit('ir_a_revision', { sala });
                 io.to(sala.codigo).emit('revision_actualizada', {
-                    palabrasInvalidas: sala.palabrasInvalidas,
+                    palabrasInvalidas: { ...sala.palabrasInvalidas },
                     confirmadosRevision: sala.confirmadosRevision
                 });
             }
         }, 1000);
     });
 
-    // 5. REGISTRAR TRAMPA
+    // Evento 5: REGISTRAR TRAMPA INMEDIATA (Solo congela la primera vez que detecta trampa)
     socket.on('registrar_trampa', ({ codigo, respuestas }) => {
-        const sala = salas[codigo];
+        const salaCodigoClean = codigo ? codigo.toUpperCase() : '';
+        const sala = salas[salaCodigoClean];
         if (!sala || sala.estado !== 'jugando') return;
 
         const jugador = sala.jugadores.find(j => j.id === socket.id);
         if (jugador) {
-            jugador.strikes += 1;
-            jugador.respuestas = respuestas;
+            // Solo sumamos strike y congelamos el snapshot la PRIMERA VEZ que hace trampa
+            if (!jugador.strikes || jugador.strikes === 0) {
+                jugador.strikes = 1;
+                // Guardamos la foto exacta de lo que tenía escrito en este preciso instante
+                jugador.respuestasValidasPreTrampa = { ...(respuestas || {}) };
+            }
+
+            jugador.respuestas = respuestas || {};
+            aplicarAnulacionPorTrampa(sala);
         }
 
-        io.to(codigo).emit('actualizar_sala', sala);
+        io.to(sala.codigo).emit('actualizar_sala', sala);
+        io.to(sala.codigo).emit('revision_actualizada', {
+            palabrasInvalidas: { ...sala.palabrasInvalidas },
+            confirmadosRevision: [...(sala.confirmadosRevision || [])]
+        });
     });
 
-    // 6. CAMBIAR ESTADO DE PALABRA
+    // 6. GUARDAR RESPUESTAS FINALES con Depuración
+    socket.on('guardar_respuestas_finales', ({ codigo, respuestas }) => {
+        const sala = salas[codigo ? codigo.toUpperCase() : ''];
+        if (!sala) return;
+
+        console.log(`💾 Guardando respuestas finales para socket ${socket.id}:`, respuestas);
+
+        const jugador = sala.jugadores.find(j => j.id === socket.id);
+        if (jugador) {
+            jugador.respuestas = respuestas || {};
+            aplicarAnulacionPorTrampa(sala);
+        }
+
+        io.to(sala.codigo).emit('actualizar_sala', sala);
+        io.to(sala.codigo).emit('revision_actualizada', {
+            palabrasInvalidas: { ...sala.palabrasInvalidas },
+            confirmadosRevision: [...(sala.confirmadosRevision || [])]
+        });
+    });
+
+    // 7. CAMBIAR ESTADO DE PALABRA
     socket.on('toggle_palabra_invalida', ({ codigo, jugadorId, categoria }) => {
         const sala = salas[codigo ? codigo.toUpperCase() : ''];
         if (!sala || sala.estado !== 'revision') return;
@@ -212,8 +275,8 @@ io.on('connection', (socket) => {
         if (socket.id === jugadorId) return;
 
         if (!sala.palabrasInvalidas) sala.palabrasInvalidas = {};
-        
-        const key = `${jugadorObjetivo.nombre.toLowerCase()}-${categoria}`;
+
+        const key = `${jugadorObjetivo.nombre.trim().toLowerCase()}-${categoria}`;
 
         if (sala.palabrasInvalidas[key]) {
             delete sala.palabrasInvalidas[key];
@@ -229,7 +292,7 @@ io.on('connection', (socket) => {
         });
     });
 
-    // 7. CONFIRMAR REVISIÓN
+    // 8. CONFIRMAR REVISIÓN
     socket.on('confirmar_revision', ({ codigo }) => {
         const sala = salas[codigo];
         if (!sala || sala.estado !== 'revision') return;
@@ -250,8 +313,15 @@ io.on('connection', (socket) => {
                 let puntosRonda = 0;
 
                 Object.keys(j.respuestas || {}).forEach(cat => {
-                    const key = `${j.nombre.toLowerCase()}-${cat}`;
-                    const estaAnulada = sala.palabrasInvalidas && sala.palabrasInvalidas[key];
+                    const nombreClean = j.nombre.trim().toLowerCase();
+                    const key = `${nombreClean}-${cat}`;
+                    const keyId = `${j.id}-${cat}`;
+
+                    // Si tiene strikes o está en palabrasInvalidas, se anula
+                    const estaAnulada = Boolean(
+                        (j.strikes || 0) > 0 ||
+                        (sala.palabrasInvalidas && (sala.palabrasInvalidas[key] || sala.palabrasInvalidas[keyId]))
+                    );
 
                     if (estaAnulada) return;
 
@@ -259,8 +329,14 @@ io.on('connection', (socket) => {
                     if (!resp) return;
 
                     const duplicados = sala.jugadores.filter(otro => {
-                        const otroKey = `${otro.nombre.toLowerCase()}-${cat}`;
-                        if (sala.palabrasInvalidas && sala.palabrasInvalidas[otroKey]) return false;
+                        const otroNombreClean = otro.nombre.trim().toLowerCase();
+                        const otroKey = `${otroNombreClean}-${cat}`;
+                        const otroKeyId = `${otro.id}-${cat}`;
+                        const otroAnulado = Boolean(
+                            (otro.strikes || 0) > 0 ||
+                            (sala.palabrasInvalidas && (sala.palabrasInvalidas[otroKey] || sala.palabrasInvalidas[otroKeyId]))
+                        );
+                        if (otroAnulado) return false;
                         return (otro.respuestas[cat] || '').trim().toLowerCase() === resp;
                     }).length;
 
@@ -276,7 +352,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 8. RECONEXIÓN
+    // 9. RECONEXIÓN
     socket.on('reconectar_jugador', ({ codigo, nombre }) => {
         const sala = salas[codigo ? codigo.toUpperCase() : ''];
         if (!sala) {
@@ -310,7 +386,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 9. SALIDA VOLUNTARIA
+    // 10. SALIDA VOLUNTARIA
     socket.on('salir_sala', ({ codigo }) => {
         const sala = salas[codigo ? codigo.toUpperCase() : ''];
         if (sala) {
@@ -330,7 +406,7 @@ io.on('connection', (socket) => {
         }
     });
 
-    // 10. DESCONEXIÓN CON TOLERANCIA
+    // 11. DESCONEXIÓN CON TOLERANCIA
     socket.on('disconnect', () => {
         Object.keys(salas).forEach(codigo => {
             const sala = salas[codigo];
